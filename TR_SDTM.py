@@ -27,7 +27,7 @@ else:
     XLA_AVAILABLE = False
 
 
-def do_nothing(x: torch.Tensor, mode:str=None):
+def do_nothing(x: torch.Tensor, mode:str=None): #merge 안하는 상황
     return x
 
 def mps_gather_workaround(input, dim, index):
@@ -40,7 +40,7 @@ def mps_gather_workaround(input, dim, index):
     else:
         return torch.gather(input, dim, index)
 
-def SSM(
+def SSM( #윈도우 단위로 토큰들을 묶고 윈도우 내에서 평균 코사인 유사도 계산 + a*(전체 토큰들의 평균 경과 시간)의 값이 큰 순서대로 내림차순 정렬
     metric: torch.Tensor,
     reduce_num: int = 0,
     threshold: float = 0,
@@ -58,42 +58,51 @@ def SSM(
         
         ws_h, ws_w = int(window_size[0]), int(window_size[1])
         stride_h, stride_w = ws_h, ws_w
-        num_token_window = stride_h * stride_w
+        num_token_window = stride_h * stride_w   # stride == window : non-overlapping window partition
         assert num_token_window > 1, "window_size must produce at least 2 tokens (K>1)."
         
         B, N, D = metric.size()
         base_grid_H = int(math.sqrt(N))
-        base_grid_W = base_grid_H
+        base_grid_W = base_grid_H #정사각으로 가정
         assert base_grid_H * base_grid_W == N and base_grid_H % ws_h == 0 and base_grid_W % ws_w == 0
 
         # metric = rearrange(metric, "b (h w) c -> b c h w", h=base_grid_H)
-        metric = metric.view(-1, base_grid_H, base_grid_W, D).permute(0, 3, 1, 2)
+        metric = metric.view(-1, base_grid_H, base_grid_W, D).permute(0, 3, 1, 2) # 원래 [B, N, D] → [B, H, W, D] → [B, D, H, W].
     
         # metric = rearrange(metric, 'b c (gh ps_h) (gw ps_w) -> b gh gw c ps_h ps_w', gh=base_grid_H//ws_h, gw=base_grid_W//ws_w)
-        metric = metric.view(B, D, base_grid_H // ws_h, ws_h, base_grid_W // ws_w, ws_w).permute(0, 2, 4, 1, 3, 5)
+        metric = metric.view(B, D, base_grid_H // ws_h, ws_h, base_grid_W // ws_w, ws_w).permute(0, 2, 4, 1, 3, 5) #[B, base_grid_H // ws_h, base_grid_W // ws_w, D, ws_h, ws_w]
         b, gh, gw, c, ps_h, ps_w = metric.shape
 
         # Flatten mxm window for pairwise operations
-        tensor_flattened = metric.reshape(b, gh, gw, c, -1)
+        tensor_flattened = metric.reshape(b, gh, gw, c, -1) #[B, gh, gw, D, K], K: 윈도우 내부 토큰 개수 (ps_h * ps_w)
     
         # Expand dims for pairwise operations
-        tensor_1 = tensor_flattened.unsqueeze(-1)
-        tensor_2 = tensor_flattened.unsqueeze(-2)
+        tensor_1 = tensor_flattened.unsqueeze(-1) # [B, gh, gw, D, K, 1]
+        tensor_2 = tensor_flattened.unsqueeze(-2) # [B, gh, gw, D, 1, K]
 
         # Compute cosine similarities
-        sims = F.cosine_similarity(tensor_1, tensor_2, dim=3)
+        sims = F.cosine_similarity(tensor_1, tensor_2, dim=3) #D차원 기준으로 코사인 유사도 계산. 결과 sims: [B, gh, gw, K, K] -> 윈도우 내부 토큰끼리 KxK 코사인 유사도 행렬
 
         # Average similarities (excluding the self-similarity)
-        similarity_map = sims.sum(-1).sum(-1) / ((ps_h * ps_w) * (ps_h * ps_w))
+        similarity_map = sims.sum(-1).sum(-1) / ((ps_h * ps_w) * (ps_h * ps_w)) # KxK 유사도 전체 평균(자기 자신 포함 평균임). shape: [B, gh, gw]
             
         # similarity_map = rearrange(similarity_map.unsqueeze(1), 'b c h w-> b (c h w)')
-        similarity_map = similarity_map.unsqueeze(1).reshape(similarity_map.size(0), -1)
+        similarity_map = similarity_map.unsqueeze(1).reshape(similarity_map.size(0), -1) # [B,1,gh,gw] → reshape로 [B, ghgw] flatten.
 
         # ---- Frequency priority score integration ----
         ssmscore_map = similarity_map
         if tore_info is not None and "states" in tore_info and tore_info["states"].get("last_independent") is not None:
-            li = tore_info["states"]["last_independent"]  # [B, N]
+            li = tore_info["states"]["last_independent"]  # [B, N] -> 얼마나 오랫동안 살아있었는지(merge 안되었는지)
             if li.shape[1] == base_grid_H * base_grid_W:
+                """
+                base_grid_H == H 
+                base_grid_W == W 
+                gh == H / ws_h : (높이 / 패치 크기 = 높이 패치 개수)
+                gw == W / ws_w : (너비 / 패치 크기 = 너비 패치 개수)
+                indiv_priority_windows는 indiv_priority_grid:(B, H, W)에서 [B, gh, gw, K]로 reshape
+                K를 기준으로 mean -> [B, gh, gw] : 윈도우 내부 K개 토큰 priority를 평균
+                indiv_priority_flat : [B, gh * gw]로 flatten하여 각 윈도우의 평균 waiting 타임이 계산됨
+                """
                 eps = 1e-6
                 li_f = li.to(similarity_map.dtype)
                 mean_li = li_f.mean(dim=1, keepdim=True) + eps
@@ -103,10 +112,10 @@ def SSM(
                     indiv_priority_grid
                     .view(B, gh, ws_h, gw, ws_w)
                     .permute(0, 1, 3, 2, 4)
-                    .reshape(B, gh, gw, ws_h * ws_w)
-                    .mean(-1)
+                    .reshape(B, gh, gw, ws_h * ws_w) #[B, gh, gw, K]
+                    .mean(-1) # [[ [[1,2,3,4],  [2,2,2,2]], [[1,1,1,1], [5,6,7,8]] ]] -> [[ [2.5, 2],  [1, 6.5] ]]
                 )  # [B, gh, gw]
-                indiv_priority_flat = indiv_priority_windows.view(B, gh * gw)
+                indiv_priority_flat = indiv_priority_windows.view(B, gh * gw) #각 윈도우의 평균 waiting 타임 계산됨
                 a_s = tore_info.get("args", {}).get("a_s", 0.0)
                 ssmscore_map = similarity_map + a_s * indiv_priority_flat
         # ----------------------------------------------
